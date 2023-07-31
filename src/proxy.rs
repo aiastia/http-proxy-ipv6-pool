@@ -10,6 +10,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpSocket,
 };
+use tokio_socks::{tcp::Socks5Stream, Error};
 
 pub async fn start_proxy(
     listen_addr: SocketAddr,
@@ -55,7 +56,7 @@ impl Proxy {
         tokio::task::spawn(async move {
             let remote_addr = req.uri().authority().map(|auth| auth.to_string()).unwrap();
             let mut upgraded = hyper::upgrade::on(req).await.unwrap();
-            self.tunnel(&mut upgraded, remote_addr).await
+            self.tunnel_socks5(&mut upgraded, remote_addr).await
         });
         Ok(Response::new(Body::empty()))
     }
@@ -69,26 +70,25 @@ impl Proxy {
         let client = Client::builder()
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
+            .proxy(hyper::Proxy::all("socks5://127.0.0.1:1080")?) // 设置SOCKS5代理地址
             .build(http);
         let res = client.request(req).await?;
         Ok(res)
     }
 
-    async fn tunnel<A>(self, upgraded: &mut A, addr_str: String) -> std::io::Result<()>
+    async fn tunnel_socks5<A>(
+        self,
+        upgraded: &mut A,
+        addr_str: String,
+    ) -> std::io::Result<()>
     where
         A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
         if let Ok(addrs) = addr_str.to_socket_addrs() {
             for addr in addrs {
-                let socket = TcpSocket::new_v6()?;
-                let bind_addr = get_rand_ipv6_socket_addr(self.ipv6, self.prefix_len);
-                if socket.bind(bind_addr).is_ok() {
-                    println!("{addr_str} via {bind_addr}");
-                    if let Ok(mut server) = socket.connect(addr).await {
-                        tokio::io::copy_bidirectional(upgraded, &mut server).await?;
-                        return Ok(());
-                    }
-                }
+                let socket = Socks5Stream::connect(addr, None).await?;
+                tokio::io::copy_bidirectional(upgraded, socket).await?;
+                return Ok(());
             }
         } else {
             println!("error: {addr_str}");
@@ -109,4 +109,15 @@ fn get_rand_ipv6(mut ipv6: u128, prefix_len: u8) -> IpAddr {
     let host_part = (rand << prefix_len) >> prefix_len;
     ipv6 = net_part | host_part;
     IpAddr::V6(ipv6.into())
+}
+
+#[tokio::main]
+async fn main() {
+    let listen_addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let ipv6_subnet = Ipv6Addr::new(0x2001, 0x19f0, 0x6001, 0x48e4, 0, 0, 0, 0);
+    let prefix_len = 64;
+
+    if let Err(e) = start_proxy(listen_addr, (ipv6_subnet, prefix_len)).await {
+        eprintln!("Error starting proxy: {}", e);
+    }
 }
